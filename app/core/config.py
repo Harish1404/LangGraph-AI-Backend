@@ -7,7 +7,7 @@ class Settings:
     FRONTEND_URL = os.getenv("FRONTEND_URL")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    FLUX_AI = os.getenv("FLUX_AI")
+    MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
     WEATHER_WEBHOOK_URL = os.getenv("WEATHER_WEBHOOK_URL")
     # LangSmith. Listed here for visibility only — the SDK reads these straight
     # out of os.environ, so it is the load_dotenv() call above that enables it.
@@ -22,6 +22,28 @@ class Settings:
 
     MONGO_URL = os.getenv("MONGO_URL")
     DB_NAME = os.getenv("DB_NAME")
+
+    # ── LangGraph checkpointer ───────────────────────────────────────────────
+    # Where the graph's own state lives, keyed by thread_id (= conversation_id).
+    # Separate from the `messages` collection: that one holds flattened text for
+    # the UI, this one holds the real message objects, tool_calls, and the
+    # paused-mid-approval state that a tool interrupt leaves behind.
+    CHECKPOINT_DB_NAME = os.getenv("CHECKPOINT_DB_NAME") or os.getenv("DB_NAME")
+    CHECKPOINT_COLLECTION = os.getenv("CHECKPOINT_COLLECTION", "checkpoints")
+    CHECKPOINT_WRITES_COLLECTION = os.getenv(
+        "CHECKPOINT_WRITES_COLLECTION", "checkpoint_writes"
+    )
+    # 0 keeps checkpoints forever. Every superstep writes a document, so a busy
+    # thread accumulates them quickly; a TTL is the only thing that bounds it.
+    CHECKPOINT_TTL_DAYS = int(os.getenv("CHECKPOINT_TTL_DAYS", "0"))
+
+    # ── Human-in-the-loop tool approval ──────────────────────────────────────
+    # Tools named here pause the graph and wait for the user to approve before
+    # they run. An allowlist rather than a code-level rule, so gating a new tool
+    # (the GitHub MCP write endpoints, when they land) is an env change.
+    HITL_TOOLS = {
+        name.strip() for name in os.getenv("HITL_TOOLS", "").split(",") if name.strip()
+    }
 
     ELEVEN_API = os.getenv("ELEVEN_API")
 
@@ -56,8 +78,13 @@ class Settings:
     # How many past TURNS (a user message + its answer) are replayed to the
     # model. Tunable without a code edit, because the right number depends on
     # the model's context window and how chatty the answers are.
+    #
+    # Only the VOICE path still reads these — app/memory/window.py, via
+    # app/routes/voice.py. Text chat gets its history from the checkpointer
+    # instead. They stay because window.py:29-31 reads all three and swallows
+    # the AttributeError, so removing them silently costs voice mode its memory
+    # rather than failing loudly.
     WINDOW_K = int(os.getenv("WINDOW_K", "4"))
-    # Long threads get a slightly wider window.
     WINDOW_K_LARGE = int(os.getenv("WINDOW_K_LARGE", "5"))
     LARGE_HISTORY_THRESHOLD = int(os.getenv("LARGE_HISTORY_THRESHOLD", "100"))
 
@@ -114,7 +141,7 @@ class Settings:
     # lowercase aliases — this is what ChatService / ChainService actually read
     gemini_api_key = GEMINI_API_KEY
     groq_api_key = GROQ_API_KEY
-    flux_ai = FLUX_AI
+    mistral_api_key = MISTRAL_API_KEY
     weather_webhook_url = WEATHER_WEBHOOK_URL
     langsmith_api_key = LANGSMITH_API_KEY
     langsmith_tracing = LANGSMITH_TRACING

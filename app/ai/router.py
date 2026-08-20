@@ -2,7 +2,7 @@ import logging
 from typing import Literal, Optional, Sequence
 
 from langchain_core.messages import BaseMessage
-from langchain_groq import ChatGroq
+from langchain_mistralai import ChatMistralAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langsmith import traceable
 from pydantic import BaseModel, Field
@@ -55,9 +55,9 @@ class QueryRouter:
         # Classification must be deterministic and cheap, so this is a separate
         # model instance from the one ChatService uses for answering. The token
         # budget has to cover the rewritten question now, not just one word.
-        primary_llm = ChatGroq(
-            model="llama-3.1-8b-instant",
-            groq_api_key=settings.groq_api_key,
+        primary_llm = ChatMistralAI(
+            model="mistral-small-latest",
+            mistral_api_key=settings.mistral_api_key,
             temperature=0,
             max_tokens=300
         )

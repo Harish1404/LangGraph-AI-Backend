@@ -61,7 +61,7 @@ graph TD
     GRAPH --> CHECKPOINT[MemorySaver checkpointer<br/>LangGraph state history]
     GRAPH --> PIPE{RAGPipeline.retrieve}
     GRAPH --> TOOLNODE[ToolNode: get_weather]
-    GRAPH --> LLM[Groq llama-3.1-8b<br/>Gemini 2.5 Flash fallback]
+    GRAPH --> LLM[Mistral mistral-small-latest<br/>Gemini 2.5 Flash fallback]
 
     VOICEEP --> STT(Groq Whisper<br/>ai/voice.py)
     STT --> SERVICE(ChatService<br/>legacy voice path<br/>ai/chat.py)
@@ -307,7 +307,7 @@ degrades to `RAG` with the original question untouched.
 
 ### Dual model with automatic fallback
 
-- **Primary**: Groq `llama-3.1-8b-instant` — fast and cheap
+- **Primary**: Mistral AI `mistral-small-latest` — fast, intelligent primary model
 - **Fallback**: Google `gemini-2.5-flash` — used automatically when Groq errors or rate-limits
 
 ### The tool loop

@@ -2,7 +2,7 @@ import json
 import logging
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_groq import ChatGroq
+from langchain_mistralai import ChatMistralAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 
@@ -15,19 +15,19 @@ logger = logging.getLogger(__name__)
 
 def get_llm():
     """
-    Initializes ChatGoogleGenerativeAI with Gemini primary and Groq fallback.
+    Initializes ChatMistralAI primary with Gemini fallback.
     """
-    gemini_key = settings.gemini_api_key
-    groq_key   = settings.groq_api_key
+    mistral_key = settings.mistral_api_key
+    gemini_key  = settings.gemini_api_key
 
-    primary_llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=gemini_key,
+    primary_llm = ChatMistralAI(
+        model="mistral-small-latest",
+        mistral_api_key=mistral_key,
         temperature=0.3
     )
-    fallback_llm = ChatGroq(
-        model="llama-3.1-8b-instant",
-        groq_api_key=groq_key,
+    fallback_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=gemini_key,
         temperature=0.3
     )
 
