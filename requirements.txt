@@ -1,0 +1,39 @@
+fastapi
+uvicorn
+
+# Voice mode. ElevenLabs is driven over its raw WebSocket via `websockets`
+# rather than through the `elevenlabs` SDK — the streaming protocol is about 40
+# readable lines and the SDK wrapper hides exactly the part worth seeing.
+groq
+websockets
+httpx
+pydantic
+
+langchain-core
+langchain-community
+langchain-text-splitters
+langchain-groq
+langchain-google-genai
+langchain-mcp-adapters
+langchain
+langsmith
+langgraph
+
+
+python-dotenv
+requests
+
+# Auth. Clerk is the identity provider; this backend is the session authority,
+# so it needs the SDK only to verify Clerk tokens and read OAuth tokens back
+# out. `svix` verifies the webhook signatures that keep the two in sync.
+clerk-backend-api
+pyjwt[crypto]
+svix
+
+pymongo
+motor
+
+pypdf
+
+
+

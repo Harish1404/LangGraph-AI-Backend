@@ -1,0 +1,42 @@
+# Environment & Secret files
+.env
+.env.*
+*.env
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# IDE & AI Tooling Config
+.claude/
+.vscode/
+.idea/
+.gemini/
+CLAUDE.md
+
+# Database & Storage
+chroma_db/
+*.sqlite3
+*.db
+
+# Local Outputs, Test Scripts & Temporary Files
+test.py
+outputs/
+recordings/
+scratch/
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
+
+# TTS cache (voice mode)
+.tts_cache/
