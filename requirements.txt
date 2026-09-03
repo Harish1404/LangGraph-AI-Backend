@@ -15,9 +15,14 @@ langchain-text-splitters
 langchain-groq
 langchain-google-genai
 langchain-mistralai
+# The DeepSeek primary is reached through OpenRouter's OpenAI-compatible
+# endpoint, so ChatOpenAI is production code, not just an eval dependency.
+# It was previously present only as a transitive dependency of openevals.
+langchain-openai
 langchain-mcp-adapters
 langchain
 langsmith
+openevals
 langgraph
 # Durable graph state. Ships one MongoDBSaver that takes a *synchronous*
 # MongoClient and wraps every blocking call in a thread for the async API —

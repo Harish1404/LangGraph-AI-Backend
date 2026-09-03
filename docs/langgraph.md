@@ -1,5 +1,20 @@
 # Migrate ChatService from LangChain Chains → LangGraph StateGraph
 
+> [!NOTE]
+> **Historical.** This document records the original migration from hand-wired chains to a single flat `StateGraph`. That flat graph has since been split into a **multi-agent supervisor with subgraphs** — the nodes and edges below still exist, but they now live in separate agent packages rather than one `app/ai/graph.py`.
+>
+> | This document says | Where it lives now |
+> |---|---|
+> | `app/ai/graph.py` | [`app/ai/agents/graph.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/agents/graph.py) (entry point) → `agents/supervisor/supervisor_graph.py` |
+> | `app/ai/router.py` | [`app/ai/agents/router.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/agents/router.py) |
+> | `ChatState` | [`app/ai/agents/state.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/agents/state.py), alongside `RagState` and `ToolState` |
+> | `route_query`, `generate` (DIRECT) | `agents/supervisor/nodes/` |
+> | `retrieve`, `retrieve_for_both` | merged into `agents/rag_agent/nodes/retrieve.py` — one node, the BOTH/RAG difference is now a conditional edge |
+> | `call_llm_with_tools`, `approve_tools`, `tools` | `agents/tool_agent/` |
+> | `MemorySaver` | `MongoDBSaver` — see [`app/ai/checkpointer.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/checkpointer.py) |
+>
+> See the **Multi-Agent Supervisor Workflow** section of the [readme](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/readme.md) for the current graph.
+
 ## Background
 
 The current codebase is a resume chatbot with 4 routes (**RAG**, **TOOL**, **BOTH**, **DIRECT**), all wired manually in [`chat.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/chat.py). The routing, tool-calling loop, memory loading, and persistence are all hand-coded Python. We want to replace this with a clean **LangGraph `StateGraph`** so the flow is visible, the tool loop uses LangGraph's built-in `ToolNode`, and memory is managed by LangGraph's checkpointer — making the codebase simple and beginner-friendly.

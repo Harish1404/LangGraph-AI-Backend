@@ -61,7 +61,7 @@ graph TD
     GRAPH --> CHECKPOINT[MemorySaver checkpointer<br/>LangGraph state history]
     GRAPH --> PIPE{RAGPipeline.retrieve}
     GRAPH --> TOOLNODE[ToolNode: get_weather]
-    GRAPH --> LLM[Mistral mistral-small-latest<br/>Gemini 2.5 Flash fallback]
+    GRAPH --> LLM[deepseek-v4-flash -> mistral-small<br/>-> gpt-oss-20b -> gemini-2.5-flash]
 
     VOICEEP --> STT(Groq Whisper<br/>ai/voice.py)
     STT --> SERVICE(ChatService<br/>legacy voice path<br/>ai/chat.py)
@@ -228,22 +228,32 @@ messages = [
 The system prompt stays first so its instructions are not buried, and the current question
 stays last so it is the most recent thing the model reads.
 
-### LangGraph StateGraph & Checkpointer
+### Multi-Agent Supervisor, Subgraphs & Checkpointer
 
-For standard text chat (`POST /chatbot`), state management and history accumulation are handled by **LangGraph** (`app/ai/graph.py`):
+For standard text chat (`POST /chatbot`), the work is split across a **supervisor graph and specialist agent subgraphs** under `app/ai/agents/` (entered via `agents/graph.py`):
 
-1. **State Definition (`ChatState`)**:
+1. **State Definitions (`agents/state.py`)**:
    ```python
-   class ChatState(TypedDict):
+   class ChatState(TypedDict):                  # the supervisor's state
        messages: Annotated[list, add_messages]  # auto-appended message history
        route: str                               # "RAG" | "TOOL" | "BOTH" | "DIRECT"
        search_query: str                        # rewritten question from router
        context: str                             # retrieved RAG context
+       user_prompt: str                         # this turn's question, verbatim
+       denied_tools: list[str]                  # tools the user refused this turn
    ```
-2. **`MemorySaver` Checkpointer**:
-   LangGraph compiles the graph with an in-memory checkpointer (`MemorySaver()`). Passing `config={"configurable": {"thread_id": conversation_id}}` automatically persists state across graph invocations for the same thread — eliminating manual window buffering logic for text chat.
-3. **Built-In `ToolNode`**:
-   Rather than running custom manual loops, the `TOOL` and `BOTH` paths leverage LangGraph's prebuilt `ToolNode([get_weather])`. When an LLM returns `tool_calls`, a conditional edge (`should_continue`) routes execution directly to `ToolNode`, which executes the tool and appends `ToolMessage` results automatically before looping back to the LLM.
+   `RagState` and `ToolState` are **subsets** of `ChatState`, sharing key names and the `add_messages` reducer. That is what lets each compiled subgraph be added to the supervisor as a plain node: LangGraph filters the parent state down on the way in and merges the returned keys back on the way out, with no adapter code in between.
+
+2. **Agent Boundaries**:
+   - **Supervisor** — `route_query` classification, `pick_route` dispatch, the `DIRECT` answer, and the sequencing of `BOTH` (`rag_agent` → `tool_agent`).
+   - **`rag_agent`** — retrieval and RAG-grounded generation. Reads `route` itself so it can stop after retrieving on `BOTH`.
+   - **`tool_agent`** — the toolbelt (`toolbelt.TOOLS`, also what `_build_models` binds), the `ToolNode`, and the `approve_tools` gate.
+
+3. **`MongoDBSaver` Checkpointer**:
+   The **supervisor** is compiled with the checkpointer; the subgraphs are compiled bare. The parent's checkpointer propagates down to them, so passing `config={"configurable": {"thread_id": conversation_id}}` persists every agent's state on the same thread — and lets an `interrupt()` raised deep inside `tool_agent` survive the round-trip to the browser. Reading that pending interrupt back therefore requires `aget_state(config, subgraphs=True)` and a recursive walk (`_first_interrupt` in `app/ai/chat.py`); a one-level lookup finds nothing and looks exactly like "not waiting on anything".
+
+4. **Built-In `ToolNode`**:
+   Rather than running custom manual loops, `tool_agent` leverages LangGraph's prebuilt `ToolNode(TOOLS)`. When an LLM returns `tool_calls`, a conditional edge (`should_continue`) routes execution to `approve_tools`, which either forwards to `ToolNode` — appending `ToolMessage` results automatically before looping back to the LLM — or, on refusal, ends the agent with `denied_tools` set so the supervisor can answer without tools.
 
 ---
 
@@ -305,10 +315,85 @@ degrades to `RAG` with the original question untouched.
 
 ## 7. Generation
 
-### Dual model with automatic fallback
+### The model chain
 
-- **Primary**: Mistral AI `mistral-small-latest` — fast, intelligent primary model
-- **Fallback**: Google `gemini-2.5-flash` — used automatically when Groq errors or rate-limits
+Every model in the app is constructed in one place — [`app/ai/models.py`](../app/ai/models.py) —
+because `chat.py` and `agents/router.py` both need the same providers in the same order,
+and `chat.py` already imports `router.py`, so the shared code cannot live in either
+without closing an import cycle.
+
+Four models, fastest first, with automatic fallback between them:
+
+| # | Model | Provider | Budget | Measured TTFT |
+|---|---|---|---|---|
+| 1 | `mistral-small-latest` | Mistral | light | **0.44s** min / 0.56s median |
+| 2 | `openai/gpt-oss-20b` | Groq | **reasoning** | rate-limited (429) during benchmarking |
+| 3 | `deepseek-v4-flash` | OpenRouter | light | 0.55s min / 0.56s median |
+| 4 | `gemini-2.5-flash` | Google | light | 3.21s min / 3.30s median |
+
+**Mistral leads on reliability, not raw speed.** It and DeepSeek are effectively tied on
+first-token latency, but DeepSeek was observed *stalling part-way through a generation* —
+unsurprising given OpenRouter serves it from several different upstream providers, so
+stability varies run to run. It stays in the chain as a genuinely independent provider,
+just off the critical path, and carries a 60s request timeout so a stall fails over to
+Gemini instead of hanging the turn.
+
+Gemini is last at roughly six times the time-to-first-token.
+
+If `OPENROUTER_API_KEY` is absent the chain is built **without** DeepSeek — a three-model
+chain, with nothing else shifted. The assembled chain is logged once at startup.
+
+#### DeepSeek goes through OpenRouter, and two settings are load-bearing
+
+(Applies wherever it sits in the chain — these were tuned while it was the primary and
+still govern how it behaves as a fallback.)
+
+The direct DeepSeek account has no balance — every completion returns **402 Insufficient
+Balance** — so the model is reached through OpenRouter's OpenAI-compatible endpoint with
+`ChatOpenAI`. `DEEPSEEK_API_KEY` is kept in config for the day that account is funded.
+
+Two `extra_body` keys were measured, and **deleting either one defeats the purpose of the
+model being there at all**:
+
+| Setting | Without | With |
+|---|---|---|
+| `provider: {sort: "latency"}` | TTFT **2.90s** — default routing is not latency-aware | TTFT **0.55s** |
+| `reasoning: {enabled: False}` | Measured at a 600-token cap: **328 tokens** lost to hidden reasoning, ~270 visible | **0** reasoning, all 600 visible — roughly double the answer |
+
+OpenRouter spreads this model across upstream providers (StreamLake, NextBit and Baidu
+were all observed), and it *does* reason by default despite being marketed otherwise.
+
+### Answer length — two budgets
+
+The chain mixes two kinds of model, so it carries two ceilings:
+
+- **`LIGHT_MAX_TOKENS`** (default **2500**) — DeepSeek, Mistral, Gemini. These emit only
+  visible text, so every token reaches the reader.
+- **`REASONING_MAX_TOKENS`** (default **4000**) — `openai/gpt-oss-20b` alone, which spends
+  hidden reasoning tokens from the same allowance. A measured deep-dive answer used
+  **1375 reasoning tokens of 3617**, which is why it needs materially more than the
+  light tier for a comparable answer.
+
+A budget is a **hard ceiling**: the model stops the moment it is reached, the provider
+returns `finish_reason: "length"`, and the answer ends mid-word.
+
+The two numbers are paired deliberately: 4000 is the light tier's 2500 visible tokens plus
+~1400 of headroom for hidden reasoning, so **both tiers yield a comparable answer**. Left
+at 3000, the reasoning model would be the *weaker* one (~1600 visible) and answers would
+quietly get shorter whenever the chain fell through to it.
+
+A ceiling is not a target, which is what makes a generous one close to free — measured on
+the light tier, a two-sentence answer spends 64 tokens and a 200-word one 212, whatever the
+cap is set to. Only answers that genuinely need the room draw on it. Both are env-tunable
+without a code change.
+
+Because truncation is otherwise completely silent, `_stream_graph` watches each answer
+chunk for `finish_reason == "length"`, emits a `truncated` SSE event before `done`, and
+stores the message with `partial=True` so the notice survives a reload.
+
+Voice keeps its own, much smaller budget (`VOICE_MAX_TOKENS`, default 120) applied to
+every model in the chain: spoken answers should be short, and it is a real cost control on
+the ElevenLabs free tier.
 
 ### The tool loop
 

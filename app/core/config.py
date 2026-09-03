@@ -9,6 +9,25 @@ class Settings:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
     WEATHER_WEBHOOK_URL = os.getenv("WEATHER_WEBHOOK_URL")
+
+    # ── DeepSeek, via OpenRouter ─────────────────────────────────────────────
+    # The primary answering model. Reached through OpenRouter rather than
+    # DeepSeek's own API because the direct account has no balance: every
+    # completion on that key comes back 402 "Insufficient Balance", which would
+    # make the primary fail on every request and fall through to Mistral —
+    # adding a round-trip instead of removing one.
+    #
+    # DEEPSEEK_API_KEY is recorded for the day that account is funded. Switching
+    # back is then two lines: this key, and base_url "https://api.deepseek.com"
+    # with the bare model id "deepseek-v4-flash" (no "deepseek/" prefix).
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+    OPENROUTER_BASE_URL = os.getenv(
+        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+    )
+    # Note: "deepseek/deepseek-v4-flash-latest" is NOT a valid id on OpenRouter
+    # and returns 400.
+    DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek/deepseek-v4-flash")
     # LangSmith. Listed here for visibility only — the SDK reads these straight
     # out of os.environ, so it is the load_dotenv() call above that enables it.
     LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
@@ -45,6 +64,38 @@ class Settings:
         name.strip() for name in os.getenv("HITL_TOOLS", "").split(",") if name.strip()
     }
 
+    # ── Answer length (text chat) ────────────────────────────────────────────
+    # Two budgets, because the chain mixes two kinds of model.
+    #
+    # A budget is a hard ceiling: the model stops dead when it is reached,
+    # finish_reason comes back "length", and the reply ends mid-word. When that
+    # happens the stream emits a `truncated` event and the UI says so rather
+    # than leaving it a mystery — see _stream_graph in app/ai/chat.py.
+    #
+    # LIGHT applies to the models that emit only visible text: DeepSeek (with
+    # reasoning explicitly disabled — see app/ai/models.py), Mistral and Gemini.
+    # Every token of it reaches the reader.
+    #
+    # REASONING applies to openai/gpt-oss-20b alone, which spends hidden
+    # reasoning tokens out of the same budget. A measured deep-dive answer used
+    # 1375 reasoning tokens of 3617, so it needs materially more than the light
+    # tier to produce a comparable answer.
+    #
+    # On the numbers: a budget is a ceiling, not a target — measured on the
+    # light tier, a two-sentence answer spent 61 tokens and a 200-word one 255,
+    # and those cost exactly the same whatever this is set to. Only answers that
+    # genuinely need the room draw on it, so a generous ceiling is close to free.
+    #
+    # 2500 is sized from the answers that were being cut: a deep dive with tables
+    # measured ~2250 visible tokens. At the earlier 600 it stopped mid-row.
+    LIGHT_MAX_TOKENS = int(os.getenv("LIGHT_MAX_TOKENS", "2500"))
+    # 4000 = the light tier's 2500 visible, plus ~1400 of headroom for the
+    # hidden reasoning. Sized so both tiers yield a comparable answer: leaving
+    # this at 3000 while LIGHT rose to 2500 would make the reasoning model the
+    # *weaker* one (~1600 visible), so an answer would quietly get shorter
+    # whenever the chain fell through to it.
+    REASONING_MAX_TOKENS = int(os.getenv("REASONING_MAX_TOKENS", "4000"))
+
     ELEVEN_API = os.getenv("ELEVEN_API")
 
     # ── Voice mode ───────────────────────────────────────────────────────────
@@ -66,7 +117,7 @@ class Settings:
     # What the browser's AudioWorklet is asked to produce. Whisper downsamples
     # to 16k internally anyway, so sending more than this is wasted bandwidth.
     MIC_SAMPLE_RATE = int(os.getenv("MIC_SAMPLE_RATE", "16000"))
-    # Spoken answers are capped far below the text path's 500. Long answers are
+    # Spoken answers are capped far below the text path's budget. Long answers are
     # bad voice UX, slow to first audio, and on the free tier a single 2000-char
     # reply costs 1000 of the month's 10000 credits.
     VOICE_MAX_TOKENS = int(os.getenv("VOICE_MAX_TOKENS", "120"))
@@ -153,6 +204,12 @@ class Settings:
     tts_sample_rate = TTS_SAMPLE_RATE
     mic_sample_rate = MIC_SAMPLE_RATE
     voice_max_tokens = VOICE_MAX_TOKENS
+    light_max_tokens = LIGHT_MAX_TOKENS
+    reasoning_max_tokens = REASONING_MAX_TOKENS
+    deepseek_api_key = DEEPSEEK_API_KEY
+    openrouter_api_key = OPENROUTER_API_KEY
+    openrouter_base_url = OPENROUTER_BASE_URL
+    deepseek_model = DEEPSEEK_MODEL
     tts_cache_enabled = TTS_CACHE_ENABLED
     clerk_secret_key = CLERK_SECRET_KEY
     clerk_webhook_secret = CLERK_WEBHOOK_SECRET

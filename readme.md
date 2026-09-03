@@ -21,49 +21,72 @@ Comprehensive technical documentation is available in the [`docs/`](file:///c:/U
 
 ---
 
-## ⚡ LangGraph StateGraph Workflow
+## ⚡ Multi-Agent Supervisor Workflow
 
-The core chat pipeline (`POST /chatbot`) is powered by a **LangGraph StateGraph** defined in [`app/ai/graph.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/graph.py). The graph decouples execution into discrete, testable nodes connected by conditional edges, state reducers, and automatic checkpointing.
+The core chat pipeline (`POST /chatbot`) is a **supervisor graph orchestrating specialist agents**, each a LangGraph subgraph with its own nodes. The entry point is [`app/ai/agents/graph.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/agents/graph.py); the supervisor itself lives in [`supervisor/supervisor_graph.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/agents/supervisor/supervisor_graph.py).
+
+```
+app/ai/agents/
+├── state.py                  # ChatState (parent) + RagState + ToolState
+├── router.py                 # QueryRouter
+├── graph.py                  # public entry point
+├── supervisor/               # orchestration + the DIRECT route
+│   ├── supervisor_graph.py
+│   └── nodes/{route_query,generate}.py
+├── rag_agent/                # owns retrieval
+│   ├── rag_graph.py
+│   └── nodes/{retrieve,generate}.py
+└── tool_agent/               # owns tools + the approval gate
+    ├── tool_graph.py
+    ├── toolbelt.py
+    └── nodes/{call_llm_with_tools,approve_tools}.py
+```
 
 ```mermaid
 graph TD
-    START["__start__"] --> route_query["route_query node<br/>(QueryRouter classification)"]
-    
-    route_query --> pick_route{"pick_route<br/>(conditional edge)"}
-    
-    pick_route -->|"RAG"| retrieve["retrieve node<br/>(hybrid vector search)"]
-    pick_route -->|"TOOL"| call_llm_with_tools["call_llm_with_tools node<br/>(LLM with weather tool)"]
-    pick_route -->|"BOTH"| retrieve_for_both["retrieve_for_both node<br/>(vector search + context)"]
-    pick_route -->|"DIRECT"| generate["generate node<br/>(plain LLM completion)"]
+    START["__start__"] --> route_query["route_query<br/>(QueryRouter classification)"]
 
-    retrieve --> generate
-    retrieve_for_both --> call_llm_with_tools
+    route_query --> pick_route{"pick_route"}
 
-    call_llm_with_tools --> should_continue{"should_continue<br/>(conditional edge)"}
-    should_continue -->|"tool_calls"| tools["tools node<br/>(LangGraph ToolNode)"]
-    should_continue -->|"no tool_calls"| END["__end__"]
-    
-    tools --> call_llm_with_tools
+    pick_route -->|"RAG / BOTH"| rag_agent
+    pick_route -->|"TOOL"| tool_agent
+    pick_route -->|"DIRECT"| generate["generate<br/>(plain LLM completion)"]
+
+    subgraph rag_agent["🔍 rag_agent (subgraph)"]
+        rag_retrieve["retrieve<br/>(hybrid vector search)"] --> rag_answer{"route == BOTH?"}
+        rag_answer -->|"no"| rag_generate["generate<br/>(RAG-grounded answer)"]
+    end
+
+    subgraph tool_agent["🔧 tool_agent (subgraph)"]
+        call_llm["call_llm_with_tools"] --> should_continue{"tool_calls?"}
+        should_continue -->|"yes"| approve["approve_tools<br/>(HITL interrupt gate)"]
+        approve -->|"accept"| tools["tools<br/>(LangGraph ToolNode)"]
+        tools --> call_llm
+    end
+
+    rag_agent -->|"route == BOTH"| tool_agent
+    rag_agent -->|"route == RAG"| END["__end__"]
+    tool_agent -->|"tool refused"| generate
+    tool_agent -->|"answered"| END
     generate --> END
 ```
 
-### LangGraph Components & Design
+### Components & Design
 
-1. **State Management (`ChatState`)**:
-   - `messages`: Annotated list using `add_messages` reducer to accumulate conversation history automatically.
-   - `route`: Active route (`"RAG"`, `"TOOL"`, `"BOTH"`, `"DIRECT"`).
-   - `search_query`: Self-contained standalone query rewritten by the router for vector search.
-   - `context`: Retrieved document chunks formatted for LLM context.
-2. **Nodes & Responsibility**:
-   - **`route_query`**: Calls `QueryRouter` to classify the query and resolve pronouns/back-references.
-   - **`retrieve` / `retrieve_for_both`**: Executes MongoDB Atlas hybrid search (Vector Search + Keyword BM25 + RRF).
-   - **`call_llm_with_tools`**: Invokes LLM with bound tools (`get_weather`).
-   - **`generate`**: Generates direct or RAG-synthesized Markdown answers.
-   - **`tools`**: Built-in LangGraph `ToolNode` that executes requested tools and appends `ToolMessage` results automatically.
+1. **State Management (`agents/state.py`)**:
+   - `ChatState` is the supervisor's state; `RagState` and `ToolState` are **subsets** of it, which is what lets each compiled subgraph be dropped into the parent as a plain node with no adapter code.
+   - `messages`: annotated with the `add_messages` reducer in **every** schema — without it a subgraph would replace conversation history instead of appending to it.
+   - `route`: active route (`"RAG"`, `"TOOL"`, `"BOTH"`, `"DIRECT"`); `search_query`: the router's standalone rewrite; `context`: retrieved chunks; `denied_tools`: tools the user refused this turn.
+2. **Agents & Responsibility**:
+   - **Supervisor** — routes the turn, owns the `DIRECT` answer, and sequences the two-agent `BOTH` route.
+   - **`rag_agent`** — MongoDB Atlas hybrid search (Vector + BM25 + RRF) and RAG-grounded answers. On `BOTH` it retrieves and stops, handing the context to the tool agent.
+   - **`tool_agent`** — the toolbelt, the `ToolNode`, and the `approve_tools` human-in-the-loop gate. On refusal it ends with `denied_tools` set, and the supervisor takes over (a subgraph cannot jump to a parent node).
 3. **Conditional Edges**:
-   - **`pick_route`**: Inspects `state["route"]` to dynamically branch to `retrieve`, `call_llm_with_tools`, `retrieve_for_both`, or `generate`.
-   - **`should_continue`**: Inspects `AIMessage.tool_calls` to route into `tools` (ToolNode) or terminate at `END`.
-4. **Memory & Checkpointing**:
+   - **`pick_route`**: inspects `state["route"]` to dispatch to `rag_agent`, `tool_agent`, or `generate`.
+   - **`after_rag`** / **`after_tools`**: continue the `BOTH` chain, and catch the refused-tool fallback.
+   - **`should_continue`** (inside `tool_agent`): inspects `AIMessage.tool_calls` to route into the approval gate or terminate.
+4. **Adding an agent**: a new folder with its own compiled subgraph, one `add_node`, and one branch in `pick_route`.
+5. **Memory & Checkpointing**:
    - Uses `MemorySaver` checkpointer compiled with thread isolation (`thread_id = conversation_id`).
    - Eliminates manual window management for text chat while MongoDB `conversation_store` maintains persistence for UI history.
 5. **Latency & Graph Caching**:
@@ -74,12 +97,12 @@ graph TD
 
 ## ✨ Key Features & Capabilities
 
-### 1. Dynamic Query Routing via LangGraph
-Before executing any retrieval or LLM generation, an ultra-fast classification node (`route_query`) categorizes incoming prompts into one of four distinct execution routes:
-- **`RAG`**: Performs hybrid search over uploaded knowledge base documents in MongoDB Atlas (no tools).
-- **`TOOL`**: Executes external tools directly (e.g. `get_weather` webhook) without performing document retrieval.
-- **`BOTH`**: Retrieves knowledge base context first to resolve entity/location details, then executes the tool call with the extracted context.
-- **`DIRECT`**: Answers directly from the LLM's parametric knowledge for general conversation.
+### 1. Dynamic Agent Routing via the Supervisor
+Before any retrieval or LLM generation, an ultra-fast classification node (`route_query`) categorizes incoming prompts into one of four execution routes, and the supervisor dispatches each to the agent that owns it:
+- **`RAG`** → `rag_agent`: hybrid search over uploaded knowledge base documents in MongoDB Atlas, then answers from them (no tools).
+- **`TOOL`** → `tool_agent`: executes external tools (e.g. `get_weather` webhook) without performing document retrieval.
+- **`BOTH`** → `rag_agent` **then** `tool_agent`: retrieves context first to resolve entity/location details, then executes the tool call with that context in the prompt. The only route that spans two agents, sequenced by the supervisor.
+- **`DIRECT`** → the supervisor's own `generate`: answers from the LLM's parametric knowledge for general conversation.
 
 ### 2. MongoDB Atlas Hybrid Search & RRF
 - **Vector Search (`$vectorSearch`)**: Dense semantic search using Google's `models/gemini-embedding-001` (768 dimensions) with Cosine similarity.
