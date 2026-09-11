@@ -32,6 +32,22 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None
 
 
+class ToolDecision(BaseModel):
+    """
+    A user's answer to a tool-approval prompt.
+
+    There is deliberately no tool_call_id here. The graph already knows which
+    call it paused on — it is sitting in the checkpoint — and accepting an id
+    from the client would only create a way to answer a *different* prompt than
+    the one shown.
+
+    `reason` is passed to the model on the reject path so the refusal can be
+    acknowledged in the answer rather than ignored.
+    """
+    action: Literal["accept", "reject"]
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
 class ConversationCreate(BaseModel):
     """Same rule as ChatRequest: the owner comes from the session, not the body."""
     title: Optional[str] = Field(default=None, max_length=200)

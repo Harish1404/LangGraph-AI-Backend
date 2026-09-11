@@ -14,10 +14,17 @@ langchain-community
 langchain-text-splitters
 langchain-groq
 langchain-google-genai
-langchain-mcp-adapters
+langchain-mistralai
+
+langchain-openai
 langchain
 langsmith
+openevals
 langgraph
+# Durable graph state. Ships one MongoDBSaver that takes a *synchronous*
+# MongoClient and wraps every blocking call in a thread for the async API —
+# which is why it needs its own client rather than reusing the motor one.
+langgraph-checkpoint-mongodb
 
 
 python-dotenv

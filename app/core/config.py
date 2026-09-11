@@ -7,8 +7,9 @@ class Settings:
     FRONTEND_URL = os.getenv("FRONTEND_URL")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    FLUX_AI = os.getenv("FLUX_AI")
+    MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
     WEATHER_WEBHOOK_URL = os.getenv("WEATHER_WEBHOOK_URL")
+
     # LangSmith. Listed here for visibility only — the SDK reads these straight
     # out of os.environ, so it is the load_dotenv() call above that enables it.
     LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
@@ -22,6 +23,59 @@ class Settings:
 
     MONGO_URL = os.getenv("MONGO_URL")
     DB_NAME = os.getenv("DB_NAME")
+
+    # ── LangGraph checkpointer ───────────────────────────────────────────────
+    # Where the graph's own state lives, keyed by thread_id (= conversation_id).
+    # Separate from the `messages` collection: that one holds flattened text for
+    # the UI, this one holds the real message objects, tool_calls, and the
+    # paused-mid-approval state that a tool interrupt leaves behind.
+    CHECKPOINT_DB_NAME = os.getenv("CHECKPOINT_DB_NAME") or os.getenv("DB_NAME")
+    CHECKPOINT_COLLECTION = os.getenv("CHECKPOINT_COLLECTION", "checkpoints")
+    CHECKPOINT_WRITES_COLLECTION = os.getenv(
+        "CHECKPOINT_WRITES_COLLECTION", "checkpoint_writes"
+    )
+    # 0 keeps checkpoints forever. Every superstep writes a document, so a busy
+    # thread accumulates them quickly; a TTL is the only thing that bounds it.
+    CHECKPOINT_TTL_DAYS = int(os.getenv("CHECKPOINT_TTL_DAYS", "0"))
+
+    # ── Human-in-the-loop tool approval ──────────────────────────────────────
+    # Tools named here pause the graph and wait for the user to approve before
+    # they run. An allowlist rather than a code-level rule, so gating a new tool
+    # (the GitHub MCP write endpoints, when they land) is an env change.
+    HITL_TOOLS = {
+        name.strip() for name in os.getenv("HITL_TOOLS", "").split(",") if name.strip()
+    }
+
+    # ── Answer length (text chat) ────────────────────────────────────────────
+    # Two budgets, because the chain mixes two kinds of model.
+    #
+    # A budget is a hard ceiling: the model stops dead when it is reached,
+    # finish_reason comes back "length", and the reply ends mid-word. When that
+    # happens the stream emits a `truncated` event and the UI says so rather
+    # than leaving it a mystery — see _stream_graph in app/ai/chat.py.
+    #
+    # LIGHT applies to the models that emit only visible text: Mistral and Gemini.
+    # Every token of it reaches the reader.
+    #
+    # REASONING applies to openai/gpt-oss-20b alone, which spends hidden
+    # reasoning tokens out of the same budget. A measured deep-dive answer used
+    # 1375 reasoning tokens of 3617, so it needs materially more than the light
+    # tier to produce a comparable answer.
+    #
+    # On the numbers: a budget is a ceiling, not a target — measured on the
+    # light tier, a two-sentence answer spent 61 tokens and a 200-word one 255,
+    # and those cost exactly the same whatever this is set to. Only answers that
+    # genuinely need the room draw on it, so a generous ceiling is close to free.
+    #
+    # 2500 is sized from the answers that were being cut: a deep dive with tables
+    # measured ~2250 visible tokens. At the earlier 600 it stopped mid-row.
+    LIGHT_MAX_TOKENS = int(os.getenv("LIGHT_MAX_TOKENS", "2500"))
+    # 4000 = the light tier's 2500 visible, plus ~1400 of headroom for the
+    # hidden reasoning. Sized so both tiers yield a comparable answer: leaving
+    # this at 3000 while LIGHT rose to 2500 would make the reasoning model the
+    # *weaker* one (~1600 visible), so an answer would quietly get shorter
+    # whenever the chain fell through to it.
+    REASONING_MAX_TOKENS = int(os.getenv("REASONING_MAX_TOKENS", "4000"))
 
     ELEVEN_API = os.getenv("ELEVEN_API")
 
@@ -44,7 +98,7 @@ class Settings:
     # What the browser's AudioWorklet is asked to produce. Whisper downsamples
     # to 16k internally anyway, so sending more than this is wasted bandwidth.
     MIC_SAMPLE_RATE = int(os.getenv("MIC_SAMPLE_RATE", "16000"))
-    # Spoken answers are capped far below the text path's 500. Long answers are
+    # Spoken answers are capped far below the text path's budget. Long answers are
     # bad voice UX, slow to first audio, and on the free tier a single 2000-char
     # reply costs 1000 of the month's 10000 credits.
     VOICE_MAX_TOKENS = int(os.getenv("VOICE_MAX_TOKENS", "120"))
@@ -56,8 +110,13 @@ class Settings:
     # How many past TURNS (a user message + its answer) are replayed to the
     # model. Tunable without a code edit, because the right number depends on
     # the model's context window and how chatty the answers are.
+    #
+    # Only the VOICE path still reads these — app/memory/window.py, via
+    # app/routes/voice.py. Text chat gets its history from the checkpointer
+    # instead. They stay because window.py:29-31 reads all three and swallows
+    # the AttributeError, so removing them silently costs voice mode its memory
+    # rather than failing loudly.
     WINDOW_K = int(os.getenv("WINDOW_K", "4"))
-    # Long threads get a slightly wider window.
     WINDOW_K_LARGE = int(os.getenv("WINDOW_K_LARGE", "5"))
     LARGE_HISTORY_THRESHOLD = int(os.getenv("LARGE_HISTORY_THRESHOLD", "100"))
 
@@ -114,7 +173,7 @@ class Settings:
     # lowercase aliases — this is what ChatService / ChainService actually read
     gemini_api_key = GEMINI_API_KEY
     groq_api_key = GROQ_API_KEY
-    flux_ai = FLUX_AI
+    mistral_api_key = MISTRAL_API_KEY
     weather_webhook_url = WEATHER_WEBHOOK_URL
     langsmith_api_key = LANGSMITH_API_KEY
     langsmith_tracing = LANGSMITH_TRACING
@@ -126,6 +185,8 @@ class Settings:
     tts_sample_rate = TTS_SAMPLE_RATE
     mic_sample_rate = MIC_SAMPLE_RATE
     voice_max_tokens = VOICE_MAX_TOKENS
+    light_max_tokens = LIGHT_MAX_TOKENS
+    reasoning_max_tokens = REASONING_MAX_TOKENS
     tts_cache_enabled = TTS_CACHE_ENABLED
     clerk_secret_key = CLERK_SECRET_KEY
     clerk_webhook_secret = CLERK_WEBHOOK_SECRET

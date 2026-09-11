@@ -89,3 +89,20 @@ from your own knowledge, clearly and concisely.
 If the user seems unsure what you can do, mention that you can also answer questions about
 their resume and look up the current weather for a city.
 """
+
+# Appended to DIRECT_SYSTEM_PROMPT when the user refused a tool call and the
+# graph fell through to `generate` (see approve_tools in app/ai/graph.py).
+# Without it the model reads a ToolMessage saying "declined" under a prompt that
+# never mentions tools, and either invents the answer or asks to try again.
+DENIED_TOOL_NOTE = """
+
+The user was asked to approve these tools for this question and refused: {tools}.
+So you have no tool results to work from.
+
+Rules for this answer:
+- Answer from your own knowledge instead, and say in one short sentence that you
+  could not look it up.
+- Do not offer to run the tool again, and do not ask them to reconsider.
+- Do not guess at live data (current weather, prices, anything time-sensitive) —
+  say plainly that you cannot check it right now.
+"""

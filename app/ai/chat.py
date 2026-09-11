@@ -4,10 +4,10 @@ import logging
 import traceback
 from functools import lru_cache
 
-from langchain_groq import ChatGroq
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, ToolMessage
 from langsmith import traceable
+
+from app.ai.models import log_chain, ordered_models
 
 from app.core.tracing import (
     summarize_messages,
@@ -25,8 +25,9 @@ from app.prompts.router_prompt import (
 from app.prompts.voice_prompt import VOICE_SYSTEM_PROMPT
 from app.core.config import settings
 from app.rag.rag_pipeline import rag_pipeline
-from app.ai.router import query_router
-from app.tools.weather import get_weather
+from app.ai.agents.router import query_router
+from app.ai.agents.tool_agent.toolbelt import TOOLS
+from app.ai.agents.tool_agent.tools.weather import get_weather
 
 # logger lets us print debug/error messages to the console with proper labels
 logger = logging.getLogger(__name__)
@@ -38,49 +39,47 @@ _pending_writes: set[asyncio.Task] = set()
 
 
 @lru_cache(maxsize=4)
-def _build_models(max_tokens: int):
-    """The model trio for a given token budget, built once per process.
+def _build_models(light_tokens: int, reasoning_tokens: int):
+    """The model chain for a pair of token budgets, built once per process.
+
+    Ordered fastest-first — see app/ai/models.py for the measurements behind it:
+
+        mistral-small  →  gpt-oss-20b  →  gemini-3.5-flash-lite
+
+    Two budgets rather than one because the chain mixes two kinds of model.
+    `light_tokens` goes to the two that emit only visible text; the Groq model
+    reasons, and its hidden tokens come out of the same allowance, so it gets
+    `reasoning_tokens` instead. Voice passes the same small number for both.
 
     Constructing these is expensive and, crucially, *not* a one-off cold start:
-    measured here, ChatGoogleGenerativeAI takes ~740ms and ChatGroq ~490ms
-    EVERY time, so building them per request put a flat ~1.2s in front of every
-    answer — voice and text alike — before a single byte was sent to any API.
-
-    They are stateless HTTP clients, so one set per token budget is safe to
-    share across requests, the same way app/ai/router.py already keeps a
-    module-level singleton. Cached on max_tokens because that is the only thing
-    that varies (500 for text, ~120 for voice), which means two entries.
+    every client benefits from being a singleton. They are stateless HTTP
+    clients, so one set per budget pair is safe to share across requests, cached
+    via @lru_cache.
     """
-    primary_llm = ChatGroq(
-        model="llama-3.1-8b-instant",
-        groq_api_key=settings.groq_api_key,
-        temperature=0.7,
-        max_tokens=max_tokens,
-    )
+    primary, *fallbacks = ordered_models(light_tokens, reasoning_tokens)
 
-    fallback_llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=settings.gemini_api_key,
-        temperature=0.7,
-        max_output_tokens=max_tokens,
-    )
-
-    llm_with_fallbacks = primary_llm.with_fallbacks([fallback_llm])
+    llm_with_fallbacks = primary.with_fallbacks(fallbacks)
 
     # Note the order: bind_tools() must be applied to each *model* first,
     # because with_fallbacks() returns a RunnableWithFallbacks, which has no
     # bind_tools() method of its own.
-    llm_with_tools = primary_llm.bind_tools([get_weather]).with_fallbacks(
-        [fallback_llm.bind_tools([get_weather])]
+    # TOOLS comes from the tool agent's toolbelt, so the model's bindings and
+    # the graph's ToolNode can never drift apart.
+    llm_with_tools = primary.bind_tools(TOOLS).with_fallbacks(
+        [model.bind_tools(TOOLS) for model in fallbacks]
     )
 
     return llm_with_fallbacks, llm_with_tools
 
 
 def warm_up_models() -> None:
-    """Build both token-budget variants at startup rather than mid-request."""
-    for budget in (500, settings.voice_max_tokens):
-        _build_models(budget)
+    """Build both budget variants at startup rather than mid-request."""
+    log_chain()
+    for budgets in (
+        (settings.light_max_tokens, settings.reasoning_max_tokens),
+        (settings.voice_max_tokens, settings.voice_max_tokens),
+    ):
+        _build_models(*budgets)
 
 
 async def warm_up_llm() -> None:
@@ -92,7 +91,9 @@ async def warm_up_llm() -> None:
     first chat/completions call paying for TLS setup.
     """
     try:
-        llm, _ = _build_models(settings.voice_max_tokens)
+        llm, _ = _build_models(
+            settings.voice_max_tokens, settings.voice_max_tokens
+        )
         async for _ in llm.astream([HumanMessage(content="hi")]):
             break  # one token is enough to establish the connection
         logger.info("LLM connection warmed up")
@@ -178,7 +179,13 @@ class ChatService:
         # a 2000-character reply is a tenth of the month's credits.
         if voice_mode:
             self.history.insert(0, SystemMessage(content=VOICE_SYSTEM_PROMPT))
-        max_tokens = settings.voice_max_tokens if voice_mode else 500
+        # Voice caps every model at the same small number; text uses the
+        # two-tier pair so the reasoning model gets room for its hidden tokens.
+        budgets = (
+            (settings.voice_max_tokens, settings.voice_max_tokens)
+            if voice_mode
+            else (settings.light_max_tokens, settings.reasoning_max_tokens)
+        )
 
         # Filled in once the router has run.
         self.route: str | None = None
@@ -195,7 +202,7 @@ class ChatService:
 
         # Shared across requests — see _build_models for why this is not done
         # inline here any more.
-        self.llm_with_fallbacks, self.llm_with_tools = _build_models(max_tokens)
+        self.llm_with_fallbacks, self.llm_with_tools = _build_models(*budgets)
 
     # ── Entry point ──────────────────────────────────────────────────────────
 
@@ -536,65 +543,223 @@ class ChatService:
 # SECTION 2: LangGraph Streaming (replaces ChatService for text chat)
 # ─────────────────────────────────────────────────────────
 
-async def stream_chat(user_prompt: str, conversation_id: str):
+# Which graph nodes produce text meant for the user now lives with the agents
+# that own those nodes — see ANSWER_NODES in app/ai/agents/graph.py, which
+# unions one small set per agent.
+#
+# It is read through a lazy import inside _stream_graph rather than imported at
+# module scope, for the same reason get_chat_graph is: the agents' node modules
+# import _build_models from this file, so a top-level import here would close
+# the loop into a circular import.
+
+
+def sse(event: str, data: dict) -> str:
     """
-    Invoke the LangGraph and stream tokens back to the caller.
+    One Server-Sent Event, properly framed.
 
-    This is the new entry point for text chat (POST /chatbot).
-    Voice mode still uses the ChatService above.
+    The stream carries more than text now — a run can stop halfway to ask the
+    user to approve a tool call — so the client needs to tell the kinds apart.
+    Named events do that with no in-band escaping and no sentinel string the
+    model could ever produce by accident.
 
-    How it works:
-      1. We import the compiled graph (chat_graph) from app/ai/graph.py.
-      2. We pass the user message + a thread_id config to astream_events().
-      3. LangGraph's MemorySaver checkpointer automatically loads/saves
-         conversation history for this thread_id — no manual memory management.
-      4. We yield text tokens as they stream from the LLM.
-      5. After streaming, we persist the final answer to MongoDB so the
-         conversation list and transcript endpoints still work.
+    Event types on this stream:
+      token      {"t": "..."}      a piece of the answer
+      interrupt  {...}             the run paused; payload says what for
+      truncated  {"reason": "length"}  the answer hit the token ceiling
+      done       {"conversation_id": "..."}
+      error      {"detail": "..."}
+    """
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _first_interrupt(snapshot) -> dict | None:
+    """
+    Walk a state snapshot and its nested subgraph snapshots for an interrupt.
+
+    The recursion is the point. interrupt() is called by approve_tools, which
+    lives *inside* the tool agent subgraph, so the pending interrupt hangs off
+    the state of the supervisor's `tool_agent` task rather than off the
+    supervisor's own task list. Looking only one level deep finds nothing,
+    which reads exactly like "this thread is not waiting on anything" — the
+    resume endpoint would 409 and tool approval would be dead.
+    """
+    for task in snapshot.tasks:
+        for value in getattr(task, "interrupts", ()) or ():
+            return value.value
+
+        # Populated only when aget_state was called with subgraphs=True.
+        nested = getattr(task, "state", None)
+        if nested is not None and hasattr(nested, "tasks"):
+            found = _first_interrupt(nested)
+            if found is not None:
+                return found
+
+    return None
+
+
+async def _pending_interrupt(graph, config) -> dict | None:
+    """
+    What this thread is waiting on, or None if it ran to completion.
+
+    An interrupt is not an event on the stream — it is a state the graph is
+    left sitting in — so it has to be read back off the checkpoint after the
+    run unwinds.
+    """
+    snapshot = await graph.aget_state(config, subgraphs=True)
+
+    return _first_interrupt(snapshot)
+
+
+async def _stream_graph(graph_input, conversation_id: str):
+    """
+    Drive the graph and frame everything it produces as SSE.
+
+    Shared by the first turn (stream_chat) and by the continuation after an
+    approval (resume_chat). The only difference between the two is what goes in
+    at the top: a new message, or a Command carrying the user's decision.
     """
     # Lazy import to avoid circular dependency (graph.py imports from chat.py)
-    from app.ai.graph import chat_graph
+    from app.ai.agents.graph import ANSWER_NODES, get_chat_graph
 
-    # thread_id is what the MemorySaver uses to key conversation state.
+    graph = get_chat_graph()
+
+    # thread_id is what the checkpointer keys conversation state by.
     # Our conversation_id maps directly to it.
     config = {"configurable": {"thread_id": conversation_id}}
 
-    # The input to the graph: just the new user message.
-    # The checkpointer will automatically prepend the conversation history.
-    input_state = {"messages": [HumanMessage(content=user_prompt)]}
-
-    # Collect the full answer for persistence
     parts: list[str] = []
+    interrupted = False
+    truncated = False
 
     try:
         # astream_events gives us fine-grained events from every node.
         # We filter for "on_chat_model_stream" to get LLM tokens.
-        async for event in chat_graph.astream_events(input_state, config, version="v2"):
-            if event["event"] == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                token = content_to_text(chunk.content)
-                if token:
-                    parts.append(token)
-                    yield token
+        async for event in graph.astream_events(graph_input, config, version="v2"):
+            if event["event"] != "on_chat_model_stream":
+                continue
+
+            # Which node this model call belongs to — see ANSWER_NODES.
+            if (event.get("metadata") or {}).get("langgraph_node") not in ANSWER_NODES:
+                continue
+
+            chunk = event["data"]["chunk"]
+
+            # Did the model stop because it ran out of budget rather than
+            # because it was finished? Checked on every chunk, not at the end:
+            # the provider attaches finish_reason to the chunk that carries it
+            # and the *final* chunk's metadata is empty, so reading only the
+            # last one finds nothing.
+            #
+            # Filtering by ANSWER_NODES above also keeps the router out of
+            # this — its classifier is capped far lower and legitimately runs
+            # to its limit without that meaning anything to the user.
+            if (getattr(chunk, "response_metadata", None) or {}).get(
+                "finish_reason"
+            ) == "length":
+                truncated = True
+
+            token = content_to_text(chunk.content)
+            if token:
+                parts.append(token)
+                yield sse("token", {"t": token})
+
+        pending = await _pending_interrupt(graph, config)
+
+        if pending:
+            interrupted = True
+            yield sse("interrupt", pending)
+        else:
+            # Announced before `done` so the client can attach it to the
+            # message it is about to commit.
+            if truncated:
+                # Which ceiling it hit depends on which model answered, so both
+                # are logged rather than guessing.
+                logger.warning(
+                    "Answer for %s hit its token ceiling "
+                    "(LIGHT_MAX_TOKENS=%d, REASONING_MAX_TOKENS=%d).",
+                    conversation_id,
+                    settings.light_max_tokens,
+                    settings.reasoning_max_tokens,
+                )
+                yield sse("truncated", {"reason": "length"})
+
+            yield sse("done", {"conversation_id": conversation_id})
 
     except Exception as e:
         logger.error(f"LangGraph chat failed: {e}\n{traceback.format_exc()}")
-        yield f"\n[ERROR: Chat service error — {e}]"
+        yield sse("error", {"detail": f"Chat service error — {e}"})
 
     finally:
         # Persist the answer to MongoDB so it shows up in the conversation
         # list, transcript, and sidebar. The checkpointer handles LLM memory,
         # but the UI still reads from MongoDB.
+        #
+        # Not on the interrupt path: the turn is not over, and whatever the
+        # model said before asking for approval ("Let me check that for you…")
+        # is not the answer. Writing it would leave a stub in the transcript
+        # that the real answer then appears *after*.
         answer = "".join(parts)
-        if answer.strip():
+        if answer.strip() and not interrupted:
             try:
                 await conversation_store.append_message(
                     conversation_id,
                     role="assistant",
                     content=answer,
+                    # Stored so the "cut off" notice survives a reload — the
+                    # transcript is what the UI reads back, and an incomplete
+                    # answer should not look finished the second time either.
+                    partial=truncated,
                 )
             except Exception as e:
                 logger.error(
                     f"Failed to persist assistant message for {conversation_id}: {e}"
                 )
+
+
+async def stream_chat(user_prompt: str, conversation_id: str):
+    """
+    One turn of text chat: POST /chatbot. Voice mode still uses ChatService.
+
+    The input is only the new message — the checkpointer prepends this thread's
+    history from MongoDB, so there is no manual memory management here.
+
+    The stream may end in `done` (answer complete) or in `interrupt` (the graph
+    paused for tool approval and is waiting on POST /chatbot/{id}/resume).
+    """
+    async for frame in _stream_graph(
+        {"messages": [HumanMessage(content=user_prompt)]},
+        conversation_id,
+    ):
+        yield frame
+
+
+async def resume_chat(conversation_id: str, decision: dict):
+    """
+    Continue a thread that paused for tool approval: POST /chatbot/{id}/resume.
+
+    Command(resume=...) does not restart the graph — it reloads the checkpoint,
+    re-runs the interrupted node with `decision` as the return value of its
+    interrupt() call, and carries on from there. The user's original question is
+    still in state; it does not need to be sent again.
+    """
+    from langgraph.types import Command
+
+    async for frame in _stream_graph(Command(resume=decision), conversation_id):
+        yield frame
+
+
+async def get_pending_approval(conversation_id: str) -> dict | None:
+    """
+    What this thread is waiting on, without advancing it.
+
+    Backs GET /chatbot/{id}/pending, which is what lets a browser refresh — or
+    a server restart — land back on the approval prompt instead of on a
+    conversation that appears to have stopped mid-sentence.
+    """
+    from app.ai.agents.graph import get_chat_graph
+
+    return await _pending_interrupt(
+        get_chat_graph(),
+        {"configurable": {"thread_id": conversation_id}},
+    )
 

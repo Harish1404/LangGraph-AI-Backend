@@ -78,33 +78,42 @@ The body carries **no `user_id`**. The owner is resolved from the session cookie
 see [architecture.md](architecture.md) §12.7 for why accepting one was a real
 vulnerability. An unauthenticated request never reaches step 1; it is rejected with 401.
 
-### The LangGraph Execution Flow
+### The Multi-Agent Execution Flow
 
-Text chat turns (`POST /chatbot`) are executed via a **LangGraph StateGraph** (`app/ai/graph.py`). The state history is automatically managed by `MemorySaver` using `thread_id = conversation_id`.
+Text chat turns (`POST /chatbot`) are executed via a **supervisor graph orchestrating specialist agent subgraphs** (`app/ai/agents/`, entered through `agents/graph.py`). The state history is automatically managed by the `MongoDBSaver` checkpointer using `thread_id = conversation_id`; because the agents are subgraphs compiled *without* checkpointers of their own, the parent's propagates down to all of them.
 
-#### StateGraph Topology
+#### Supervisor Topology
 
 ```mermaid
 graph TD
-    START["__start__"] --> route_query["route_query node<br/>(QueryRouter classification)"]
-    
-    route_query --> pick_route{"pick_route<br/>(conditional edge)"}
-    
-    pick_route -->|"RAG"| retrieve["retrieve node<br/>(hybrid vector search)"]
-    pick_route -->|"TOOL"| call_llm_with_tools["call_llm_with_tools node<br/>(LLM with weather tool)"]
-    pick_route -->|"BOTH"| retrieve_for_both["retrieve_for_both node<br/>(vector search + context)"]
-    pick_route -->|"DIRECT"| generate["generate node<br/>(plain LLM completion)"]
+    START["__start__"] --> route_query["route_query<br/>(QueryRouter classification)"]
 
-    retrieve --> generate
-    retrieve_for_both --> call_llm_with_tools
+    route_query --> pick_route{"pick_route"}
 
-    call_llm_with_tools --> should_continue{"should_continue<br/>(conditional edge)"}
-    should_continue -->|"tool_calls"| tools["tools node<br/>(LangGraph ToolNode)"]
-    should_continue -->|"no tool_calls"| END["__end__"]
-    
-    tools --> call_llm_with_tools
+    pick_route -->|"RAG / BOTH"| rag_agent
+    pick_route -->|"TOOL"| tool_agent
+    pick_route -->|"DIRECT"| generate["generate<br/>(plain LLM completion)"]
+
+    subgraph rag_agent["rag_agent (subgraph)"]
+        rag_retrieve["retrieve<br/>(hybrid vector search)"] --> rag_answer{"route == BOTH?"}
+        rag_answer -->|"no"| rag_generate["generate<br/>(RAG-grounded answer)"]
+    end
+
+    subgraph tool_agent["tool_agent (subgraph)"]
+        call_llm["call_llm_with_tools"] --> should_continue{"tool_calls?"}
+        should_continue -->|"yes"| approve["approve_tools<br/>(HITL interrupt gate)"]
+        approve -->|"accept"| tools["tools<br/>(LangGraph ToolNode)"]
+        tools --> call_llm
+    end
+
+    rag_agent -->|"route == BOTH"| tool_agent
+    rag_agent -->|"route == RAG"| END["__end__"]
+    tool_agent -->|"tool refused"| generate
+    tool_agent -->|"answered"| END
     generate --> END
 ```
+
+Each agent owns a slice of the work: the **supervisor** routes and handles `DIRECT`, the **rag_agent** owns retrieval, and the **tool_agent** owns the toolbelt and the approval gate. `BOTH` is the only route that spans two agents, and the supervisor is what sequences it.
 
 #### Sequence Diagram
 
@@ -152,27 +161,28 @@ sequenceDiagram
 
     rect rgb(240, 253, 244)
         Note over Graph,LLM: 5. Execute routed path & stream tokens
-        alt RAG path (route_query -> retrieve -> generate -> END)
-            Graph->>RAG: retrieve(search_query)
+        alt RAG path (supervisor -> rag_agent -> END)
+            Graph->>RAG: rag_agent: retrieve(search_query)
             RAG-->>Graph: context
-            Graph->>LLM: generate answer from context
-        else TOOL path (route_query -> call_llm_with_tools <-> ToolNode -> END)
-            Graph->>LLM: invoke with bound weather tool
+            Graph->>LLM: rag_agent: generate answer from context
+        else TOOL path (supervisor -> tool_agent -> END)
+            Graph->>LLM: tool_agent: invoke with bound weather tool
+            opt Tool requested
+                Note over Graph,Tool: approve_tools gates any tool in HITL_TOOLS
+                Graph->>Tool: execute get_weather(city)
+                Tool-->>Graph: ToolMessage(result)
+                Graph->>LLM: synthesize tool result
+            end
+        else BOTH path (supervisor -> rag_agent -> tool_agent -> END)
+            Graph->>RAG: rag_agent: retrieve(search_query), then stop
+            RAG-->>Graph: context
+            Graph->>LLM: tool_agent: invoke with context + bound tool
             opt Tool requested
                 Graph->>Tool: execute get_weather(city)
                 Tool-->>Graph: ToolMessage(result)
                 Graph->>LLM: synthesize tool result
             end
-        else BOTH path (route_query -> retrieve_for_both -> call_llm_with_tools <-> ToolNode -> END)
-            Graph->>RAG: retrieve(search_query)
-            RAG-->>Graph: context
-            Graph->>LLM: invoke with context + bound tool
-            opt Tool requested
-                Graph->>Tool: execute get_weather(city)
-                Tool-->>Graph: ToolMessage(result)
-                Graph->>LLM: synthesize tool result
-            end
-        else DIRECT path (route_query -> generate -> END)
+        else DIRECT path (supervisor -> generate -> END)
             Graph->>LLM: generate answer directly
         end
         LLM-->>User: Stream text tokens (on_chat_model_stream)
@@ -191,10 +201,10 @@ sequenceDiagram
 | 1 | **Resolve the thread** | Validates `conversation_id` or creates a new conversation thread. |
 | 2 | **Save the question** | Appends the incoming user message to MongoDB Atlas prior to streaming. |
 | 3 | **Invoke LangGraph** | `stream_chat` invokes `chat_graph.astream_events()` with `config={"configurable": {"thread_id": conversation_id}}`. |
-| 4 | **Automatic Memory Loading** | `MemorySaver` loads past `ChatState.messages` for the specified `thread_id`. |
-| 5 | **`route_query` Node** | Calls `QueryRouter.route()` to classify query into `RAG`, `TOOL`, `BOTH`, or `DIRECT` and rewrite standalone query. |
-| 6 | **`pick_route` Conditional Edge** | Evaluates `state["route"]` to select the target branch node (`retrieve`, `call_llm_with_tools`, `retrieve_for_both`, or `generate`). |
-| 7 | **Execution & `ToolNode` Loop** | RAG node fetches hybrid vector chunks. If tools are needed, `should_continue` conditional edge routes to `ToolNode([get_weather])` which appends `ToolMessage`s automatically. |
+| 4 | **Automatic Memory Loading** | The `MongoDBSaver` checkpointer loads past `ChatState.messages` for the specified `thread_id` — including the agents' state, since subgraphs share the parent's checkpointer. |
+| 5 | **`route_query` Node** | Supervisor node. Calls `QueryRouter.route()` to classify query into `RAG`, `TOOL`, `BOTH`, or `DIRECT` and rewrite standalone query. Also resets the per-turn state (`context`, `denied_tools`). |
+| 6 | **`pick_route` Conditional Edge** | Evaluates `state["route"]` to dispatch to the owning agent: `rag_agent` (RAG and BOTH), `tool_agent` (TOOL), or the supervisor's own `generate` (DIRECT). |
+| 7 | **Agent Execution** | `rag_agent` fetches hybrid vector chunks, then answers (RAG) or stops so `tool_agent` can (BOTH). Inside `tool_agent`, `should_continue` routes tool calls through the `approve_tools` HITL gate into `ToolNode(TOOLS)`, which appends `ToolMessage`s automatically. A refused tool ends the agent with `denied_tools` set, and the supervisor falls back to `generate`. |
 | 8 | **Token Streaming & Persistence** | Tokens emitted during `on_chat_model_stream` stream directly to client. Upon completion, assistant response is saved to MongoDB. |
 
 > **Teaching note — the off-by-one in step 3.** The question is saved in step 2 and loaded

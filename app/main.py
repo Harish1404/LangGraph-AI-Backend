@@ -19,9 +19,11 @@ from app.db.mongodb import (
     ensure_auth_indexes,
     ensure_chat_indexes,
 )
-from app.tools.weather import close_client as close_weather_client
+from app.ai.agents.tool_agent.tools.weather import close_client as close_weather_client
 from app.ai.voice import warm_up as warm_up_stt, remaining_credits
 from app.ai.chat import warm_up_models, warm_up_llm
+from app.ai.checkpointer import build_checkpointer, close_checkpointer
+from app.ai.agents.graph import init_chat_graph
 
 
 # Configure logging to output INFO level logs to terminal
@@ -44,6 +46,21 @@ async def lifespan(app: FastAPI):
     await connect_to_mongo()
     await ensure_chat_indexes()
     await ensure_auth_indexes()
+
+    # Compiling the graph is deferred to here rather than to import time,
+    # because the checkpointer needs a database to talk to. Raising on failure
+    # is deliberate and matches connect_to_mongo(): a server that boots without
+    # a checkpointer looks healthy while quietly losing every conversation on
+    # restart, and cannot hold a tool approval open at all.
+    app.state.checkpointer = await build_checkpointer()
+    init_chat_graph(app.state.checkpointer)
+
+    if settings.HITL_TOOLS:
+        logger.info(
+            f"Tool approval required for: {', '.join(sorted(settings.HITL_TOOLS))}"
+        )
+    else:
+        logger.info("Tool approval is off — set HITL_TOOLS to gate tools.")
 
     # Loud rather than silent: without these the auth routes cannot mint a
     # session, and the failure would otherwise only show up as a 401 at
@@ -81,6 +98,7 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Could not flush LangSmith traces: {e}")
 
     await close_weather_client()
+    await close_checkpointer()
     await close_mongo_connection()
 
 

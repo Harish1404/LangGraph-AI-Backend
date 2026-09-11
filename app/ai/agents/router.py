@@ -2,11 +2,10 @@ import logging
 from typing import Literal, Optional, Sequence
 
 from langchain_core.messages import BaseMessage
-from langchain_groq import ChatGroq
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langsmith import traceable
 from pydantic import BaseModel, Field
 
+from app.ai.models import ordered_models
 from app.core.config import settings
 from app.core.tracing import drop_self
 from app.memory.window import as_text
@@ -51,29 +50,28 @@ class QueryRouter:
     # If the model returns something unusable, fall back to the app's main purpose.
     DEFAULT_ROUTE = "RAG"
 
-    def __init__(self):
-        # Classification must be deterministic and cheap, so this is a separate
-        # model instance from the one ChatService uses for answering. The token
-        # budget has to cover the rewritten question now, not just one word.
-        primary_llm = ChatGroq(
-            model="llama-3.1-8b-instant",
-            groq_api_key=settings.groq_api_key,
-            temperature=0,
-            max_tokens=300
-        )
+    # Classification output is tiny — a route name and one rewritten sentence —
+    # so the same small budget suits every model here, including the reasoning
+    # model (Groq).
+    MAX_TOKENS = 300
 
-        fallback_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            google_api_key=settings.gemini_api_key,
-            temperature=0,
-            max_output_tokens=300
+    def __init__(self):
+        # Classification must be deterministic and cheap, so these are separate
+        # model instances from the ones the answering nodes use — same chain and
+        # same order, but temperature 0 and a much smaller budget.
+        #
+        # The router runs on *every* request, ahead of any retrieval or
+        # generation, so it is the single place where the primary model's
+        # latency matters most.
+        primary, *fallbacks = ordered_models(
+            self.MAX_TOKENS, self.MAX_TOKENS, temperature=0
         )
 
         # Same ordering rule as bind_tools() in chat.py: structured output is
         # applied to each *model* first, because with_fallbacks() returns a
         # RunnableWithFallbacks, which has no with_structured_output() of its own.
-        llm = primary_llm.with_structured_output(RouteDecision).with_fallbacks(
-            [fallback_llm.with_structured_output(RouteDecision)]
+        llm = primary.with_structured_output(RouteDecision).with_fallbacks(
+            [model.with_structured_output(RouteDecision) for model in fallbacks]
         )
 
         # The whole router, as one LCEL pipeline

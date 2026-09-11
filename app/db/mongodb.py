@@ -50,6 +50,25 @@ def get_messages_collection():
     return get_db()["messages"]
 
 
+def get_checkpoints_collection():
+    """
+    LangGraph's own state, one document per superstep, keyed by thread_id.
+
+    Distinct from `messages`, which holds flattened text for the UI. This holds
+    the real message objects, their tool_calls, and the routing state — it is
+    what the model actually reads back as memory.
+
+    Written through a separate synchronous client owned by
+    app/ai/checkpointer.py; this accessor is for reading, not for writing.
+    """
+    return get_db()[settings.CHECKPOINT_COLLECTION]
+
+
+def get_checkpoint_writes_collection():
+    """Pending writes of an uncommitted step — where a paused tool approval lives."""
+    return get_db()[settings.CHECKPOINT_WRITES_COLLECTION]
+
+
 async def ensure_chat_indexes():
     """
     Creates the indexes the chat history depends on. Idempotent — MongoDB

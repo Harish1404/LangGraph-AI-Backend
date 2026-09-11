@@ -1,8 +1,8 @@
-# LangChain RAG & Multi-Modal AI System
+# LangGraph Agentic RAG & Multi-Modal AI System
 
-A production-grade, asynchronous Retrieval-Augmented Generation (RAG) and multi-modal AI backend built with **FastAPI**, **LangChain**, **LangGraph**, and **MongoDB Atlas**.
+A production-grade, asynchronous Agentic Retrieval-Augmented Generation (RAG) and multi-modal AI backend built with **FastAPI**, **LangChain**, **LangGraph**, and **MongoDB Atlas**.
 
-This system features dynamic query routing via a **LangGraph StateGraph** (with built-in `ToolNode`, conditional edges, and `MemorySaver` checkpointer), hybrid vector & keyword retrieval fused via **Reciprocal Rank Fusion (RRF)**, automatic fallback across dual LLM providers (**Groq Llama 3.1 8B** + **Google Gemini 2.5 Flash**), tool calling with external webhooks, 3-stage LCEL document transformation chains, multi-modal capabilities (voice STT/TTS & image generation), and **Clerk-backed authentication with rotating server-issued sessions**.
+This system features dynamic query routing via a stateful **LangGraph StateGraph** (with built-in `ToolNode`, conditional edges, LRU-cached graph compilation, and `MemorySaver` checkpointer), hybrid vector & keyword retrieval fused via **Reciprocal Rank Fusion (RRF)**, automatic fallback across dual LLM providers (**Mistral AI mistral-small-latest** + **Google Gemini 2.5 Flash**), tool calling with external webhooks, 3-stage LCEL document transformation chains, multi-modal capabilities (voice STT/TTS & image generation), and **Clerk-backed authentication with rotating server-issued sessions**.
 
 ---
 
@@ -10,25 +10,99 @@ This system features dynamic query routing via a **LangGraph StateGraph** (with 
 
 Comprehensive technical documentation is available in the [`docs/`](file:///c:/Users/haris/Documents/Projects/Langchain-RAG/docs) directory:
 
-- 🏗️ **[System Architecture](docs/architecture.md)** — Complete component breakdown and system-wide Mermaid diagram. **§12 covers authentication**: the Clerk/session split, token rotation, and the ownership model.
-- 🎙️ **[Voice Mode](docs/voice-mode.md)** — The spoken path end to end: WebSocket + PCM transport, streaming TTS, the latency work, and free-tier limits.
-- 🔄 **[RAG & App Workflows](docs/workflow.md)** — Detailed sequence flows for startup ingestion, hybrid retrieval, tool execution, and streaming responses.
+- 🏗️ **[System Architecture](docs/architecture.md)** — Complete component breakdown, LangGraph StateGraph topology, and system-wide Mermaid diagram. **§12 covers authentication**: the Clerk/session split, token rotation, and ownership model.
+- 🎙️ **[Voice Mode](docs/voice-mode.md)** — The spoken path end to end: WebSocket + PCM transport, streaming TTS, latency optimizations, and free-tier limits.
+- 🔄 **[RAG & App Workflows](docs/workflow.md)** — Detailed sequence flows for startup ingestion, hybrid retrieval, LangGraph node execution, tool loops, and token streaming.
 - ✂️ **[Chunking Strategy](docs/chunking.md)** — Recursive text splitting, parameter choices, and incremental deduplication logic.
 - 🚀 **[Advanced RAG Concepts](docs/advanced-rag.md)** — Hybrid search, query expansion, re-ranking, and context compression.
-- 🤖 **[Agentic RAG Concepts](docs/agentic-rag.md)** — Planner loops, tool selection, reflection, and self-correction.
+- 🤖 **[Agentic RAG Concepts](docs/agentic-rag.md)** — Planner loops, state graph routing, tool selection, reflection, and self-correction.
 - 🕸️ **[Graph RAG Concepts](docs/graph-rag.md)** — Knowledge graphs, entity-relation extraction, and graph traversal.
 - 🧩 **[Modular RAG Concepts](docs/modular-rag.md)** — Decoupled modules and flexible pipeline architectures.
 
 ---
 
+## ⚡ Multi-Agent Supervisor Workflow
+
+The core chat pipeline (`POST /chatbot`) is a **supervisor graph orchestrating specialist agents**, each a LangGraph subgraph with its own nodes. The entry point is [`app/ai/agents/graph.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/agents/graph.py); the supervisor itself lives in [`supervisor/supervisor_graph.py`](file:///c:/Users/haris/Documents/Projects/Langgraph/Naive-RAG-LangChain/app/ai/agents/supervisor/supervisor_graph.py).
+
+```
+app/ai/agents/
+├── state.py                  # ChatState (parent) + RagState + ToolState
+├── router.py                 # QueryRouter
+├── graph.py                  # public entry point
+├── supervisor/               # orchestration + the DIRECT route
+│   ├── supervisor_graph.py
+│   └── nodes/{route_query,generate}.py
+├── rag_agent/                # owns retrieval
+│   ├── rag_graph.py
+│   └── nodes/{retrieve,generate}.py
+└── tool_agent/               # owns tools + the approval gate
+    ├── tool_graph.py
+    ├── toolbelt.py
+    └── nodes/{call_llm_with_tools,approve_tools}.py
+```
+
+```mermaid
+graph TD
+    START["__start__"] --> route_query["route_query<br/>(QueryRouter classification)"]
+
+    route_query --> pick_route{"pick_route"}
+
+    pick_route -->|"RAG / BOTH"| rag_agent
+    pick_route -->|"TOOL"| tool_agent
+    pick_route -->|"DIRECT"| generate["generate<br/>(plain LLM completion)"]
+
+    subgraph rag_agent["🔍 rag_agent (subgraph)"]
+        rag_retrieve["retrieve<br/>(hybrid vector search)"] --> rag_answer{"route == BOTH?"}
+        rag_answer -->|"no"| rag_generate["generate<br/>(RAG-grounded answer)"]
+    end
+
+    subgraph tool_agent["🔧 tool_agent (subgraph)"]
+        call_llm["call_llm_with_tools"] --> should_continue{"tool_calls?"}
+        should_continue -->|"yes"| approve["approve_tools<br/>(HITL interrupt gate)"]
+        approve -->|"accept"| tools["tools<br/>(LangGraph ToolNode)"]
+        tools --> call_llm
+    end
+
+    rag_agent -->|"route == BOTH"| tool_agent
+    rag_agent -->|"route == RAG"| END["__end__"]
+    tool_agent -->|"tool refused"| generate
+    tool_agent -->|"answered"| END
+    generate --> END
+```
+
+### Components & Design
+
+1. **State Management (`agents/state.py`)**:
+   - `ChatState` is the supervisor's state; `RagState` and `ToolState` are **subsets** of it, which is what lets each compiled subgraph be dropped into the parent as a plain node with no adapter code.
+   - `messages`: annotated with the `add_messages` reducer in **every** schema — without it a subgraph would replace conversation history instead of appending to it.
+   - `route`: active route (`"RAG"`, `"TOOL"`, `"BOTH"`, `"DIRECT"`); `search_query`: the router's standalone rewrite; `context`: retrieved chunks; `denied_tools`: tools the user refused this turn.
+2. **Agents & Responsibility**:
+   - **Supervisor** — routes the turn, owns the `DIRECT` answer, and sequences the two-agent `BOTH` route.
+   - **`rag_agent`** — MongoDB Atlas hybrid search (Vector + BM25 + RRF) and RAG-grounded answers. On `BOTH` it retrieves and stops, handing the context to the tool agent.
+   - **`tool_agent`** — the toolbelt, the `ToolNode`, and the `approve_tools` human-in-the-loop gate. On refusal it ends with `denied_tools` set, and the supervisor takes over (a subgraph cannot jump to a parent node).
+3. **Conditional Edges**:
+   - **`pick_route`**: inspects `state["route"]` to dispatch to `rag_agent`, `tool_agent`, or `generate`.
+   - **`after_rag`** / **`after_tools`**: continue the `BOTH` chain, and catch the refused-tool fallback.
+   - **`should_continue`** (inside `tool_agent`): inspects `AIMessage.tool_calls` to route into the approval gate or terminate.
+4. **Adding an agent**: a new folder with its own compiled subgraph, one `add_node`, and one branch in `pick_route`.
+5. **Memory & Checkpointing**:
+   - Uses `MemorySaver` checkpointer compiled with thread isolation (`thread_id = conversation_id`).
+   - Eliminates manual window management for text chat while MongoDB `conversation_store` maintains persistence for UI history.
+5. **Latency & Graph Caching**:
+   - Graph compilation is optimized with `@lru_cache(maxsize=4)` (`_compile_graph`).
+   - Stateless LLM instances are cached via `@lru_cache(maxsize=4)` (`_build_models`).
+
+---
+
 ## ✨ Key Features & Capabilities
 
-### 1. Dynamic Query Routing
-Before executing any retrieval or LLM generation, an ultra-fast classification chain (`QueryRouter`) categorizes incoming prompts into one of four distinct execution routes:
-- **`RAG`**: Performs hybrid search over uploaded knowledge base documents in MongoDB Atlas (no tools).
-- **`TOOL`**: Executes external tools directly (e.g. `get_weather` webhook) without performing document retrieval.
-- **`BOTH`**: Retrieves knowledge base context first to resolve entity/location details, then executes the tool call with the extracted context.
-- **`DIRECT`**: Answers directly from the LLM's parametric knowledge for general conversation.
+### 1. Dynamic Agent Routing via the Supervisor
+Before any retrieval or LLM generation, an ultra-fast classification node (`route_query`) categorizes incoming prompts into one of four execution routes, and the supervisor dispatches each to the agent that owns it:
+- **`RAG`** → `rag_agent`: hybrid search over uploaded knowledge base documents in MongoDB Atlas, then answers from them (no tools).
+- **`TOOL`** → `tool_agent`: executes external tools (e.g. `get_weather` webhook) without performing document retrieval.
+- **`BOTH`** → `rag_agent` **then** `tool_agent`: retrieves context first to resolve entity/location details, then executes the tool call with that context in the prompt. The only route that spans two agents, sequenced by the supervisor.
+- **`DIRECT`** → the supervisor's own `generate`: answers from the LLM's parametric knowledge for general conversation.
 
 ### 2. MongoDB Atlas Hybrid Search & RRF
 - **Vector Search (`$vectorSearch`)**: Dense semantic search using Google's `models/gemini-embedding-001` (768 dimensions) with Cosine similarity.
@@ -37,7 +111,7 @@ Before executing any retrieval or LLM generation, an ultra-fast classification c
 - **Automatic Index Management**: Automatically provisions `vector_index` and `keyword_index` on MongoDB Atlas via PyMongo `SearchIndexModel` on boot.
 
 ### 3. Dual LLM High Availability Engine
-- **Primary LLM**: Groq `llama-3.1-8b-instant` (ultra-low latency).
+- **Primary LLM**: Mistral AI `mistral-small-latest` (fast, high intelligence).
 - **Fallback LLM**: Google Gemini `gemini-2.5-flash` (high quality, high context).
 - Integrated seamlessly using LangChain's `with_fallbacks()` runnable wrapper to protect against rate limits and outage events.
 
@@ -63,7 +137,7 @@ Clerk handles identity; this backend owns the session and every authorization de
 Push-to-talk speech in, synthesised speech out, over a single WebSocket at **`/ws/voice`** — see **[docs/voice-mode.md](docs/voice-mode.md)**.
 - **Transport**: raw PCM16 both directions (16 kHz up, 24 kHz down). No WebRTC, no Opus, no ffmpeg — and **no new dependencies** on either side.
 - **Streaming TTS**: LLM tokens are regrouped at sentence boundaries and pushed into ElevenLabs while the model is still writing, so audio begins after the *first* sentence rather than the last.
-- **Shared brain**: the spoken path reuses the same `ChatService` — routing, retrieval, tools and memory all apply, with a voice-specific prompt for short spoken answers.
+- **Shared brain**: the spoken path reuses `ChatService` — routing, retrieval, tools and memory all apply, with a voice-specific prompt for short spoken answers.
 - **Measured**: ~0.2 s to on-screen transcript, ~1.3–1.8 s median to the first spoken word.
 
 ---
