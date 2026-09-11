@@ -44,10 +44,10 @@ def _build_models(light_tokens: int, reasoning_tokens: int):
 
     Ordered fastest-first — see app/ai/models.py for the measurements behind it:
 
-        deepseek-v4-flash  →  mistral-small  →  gpt-oss-20b  →  gemini-2.5-flash
+        mistral-small  →  gpt-oss-20b  →  gemini-3.5-flash-lite
 
     Two budgets rather than one because the chain mixes two kinds of model.
-    `light_tokens` goes to the three that emit only visible text; the Groq model
+    `light_tokens` goes to the two that emit only visible text; the Groq model
     reasons, and its hidden tokens come out of the same allowance, so it gets
     `reasoning_tokens` instead. Voice passes the same small number for both.
 

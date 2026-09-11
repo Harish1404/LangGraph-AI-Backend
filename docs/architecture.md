@@ -61,7 +61,7 @@ graph TD
     GRAPH --> CHECKPOINT[MemorySaver checkpointer<br/>LangGraph state history]
     GRAPH --> PIPE{RAGPipeline.retrieve}
     GRAPH --> TOOLNODE[ToolNode: get_weather]
-    GRAPH --> LLM[deepseek-v4-flash -> mistral-small<br/>-> gpt-oss-20b -> gemini-2.5-flash]
+    GRAPH --> LLM[mistral-small -> gpt-oss-20b<br/>-> gemini-3.5-flash-lite]
 
     VOICEEP --> STT(Groq Whisper<br/>ai/voice.py)
     STT --> SERVICE(ChatService<br/>legacy voice path<br/>ai/chat.py)
@@ -319,55 +319,24 @@ degrades to `RAG` with the original question untouched.
 
 Every model in the app is constructed in one place — [`app/ai/models.py`](../app/ai/models.py) —
 because `chat.py` and `agents/router.py` both need the same providers in the same order,
-and `chat.py` already imports `router.py`, so the shared code cannot live in either
-without closing an import cycle.
+and `chat.py` already imports `router.py`, so the shared code cannot live in either without closing an import cycle.
 
-Four models, fastest first, with automatic fallback between them:
+Three models, fastest first, with automatic fallback between them:
 
 | # | Model | Provider | Budget | Measured TTFT |
 |---|---|---|---|---|
 | 1 | `mistral-small-latest` | Mistral | light | **0.44s** min / 0.56s median |
 | 2 | `openai/gpt-oss-20b` | Groq | **reasoning** | rate-limited (429) during benchmarking |
-| 3 | `deepseek-v4-flash` | OpenRouter | light | 0.55s min / 0.56s median |
-| 4 | `gemini-2.5-flash` | Google | light | 3.21s min / 3.30s median |
+| 3 | `gemini-3.5-flash-lite` | Google | light | 3.21s min / 3.30s median |
 
-**Mistral leads on reliability, not raw speed.** It and DeepSeek are effectively tied on
-first-token latency, but DeepSeek was observed *stalling part-way through a generation* —
-unsurprising given OpenRouter serves it from several different upstream providers, so
-stability varies run to run. It stays in the chain as a genuinely independent provider,
-just off the critical path, and carries a 60s request timeout so a stall fails over to
-Gemini instead of hanging the turn.
-
-Gemini is last at roughly six times the time-to-first-token.
-
-If `OPENROUTER_API_KEY` is absent the chain is built **without** DeepSeek — a three-model
-chain, with nothing else shifted. The assembled chain is logged once at startup.
-
-#### DeepSeek goes through OpenRouter, and two settings are load-bearing
-
-(Applies wherever it sits in the chain — these were tuned while it was the primary and
-still govern how it behaves as a fallback.)
-
-The direct DeepSeek account has no balance — every completion returns **402 Insufficient
-Balance** — so the model is reached through OpenRouter's OpenAI-compatible endpoint with
-`ChatOpenAI`. `DEEPSEEK_API_KEY` is kept in config for the day that account is funded.
-
-Two `extra_body` keys were measured, and **deleting either one defeats the purpose of the
-model being there at all**:
-
-| Setting | Without | With |
-|---|---|---|
-| `provider: {sort: "latency"}` | TTFT **2.90s** — default routing is not latency-aware | TTFT **0.55s** |
-| `reasoning: {enabled: False}` | Measured at a 600-token cap: **328 tokens** lost to hidden reasoning, ~270 visible | **0** reasoning, all 600 visible — roughly double the answer |
-
-OpenRouter spreads this model across upstream providers (StreamLake, NextBit and Baidu
-were all observed), and it *does* reason by default despite being marketed otherwise.
+**Mistral leads on reliability and speed.**
+Gemini is last at roughly six times the time-to-first-token. The assembled chain is logged once at startup.
 
 ### Answer length — two budgets
 
 The chain mixes two kinds of model, so it carries two ceilings:
 
-- **`LIGHT_MAX_TOKENS`** (default **2500**) — DeepSeek, Mistral, Gemini. These emit only
+- **`LIGHT_MAX_TOKENS`** (default **2500**) — Mistral, Gemini. These emit only
   visible text, so every token reaches the reader.
 - **`REASONING_MAX_TOKENS`** (default **4000**) — `openai/gpt-oss-20b` alone, which spends
   hidden reasoning tokens from the same allowance. A measured deep-dive answer used

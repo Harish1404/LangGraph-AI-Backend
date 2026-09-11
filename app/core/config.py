@@ -10,24 +10,6 @@ class Settings:
     MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
     WEATHER_WEBHOOK_URL = os.getenv("WEATHER_WEBHOOK_URL")
 
-    # ── DeepSeek, via OpenRouter ─────────────────────────────────────────────
-    # The primary answering model. Reached through OpenRouter rather than
-    # DeepSeek's own API because the direct account has no balance: every
-    # completion on that key comes back 402 "Insufficient Balance", which would
-    # make the primary fail on every request and fall through to Mistral —
-    # adding a round-trip instead of removing one.
-    #
-    # DEEPSEEK_API_KEY is recorded for the day that account is funded. Switching
-    # back is then two lines: this key, and base_url "https://api.deepseek.com"
-    # with the bare model id "deepseek-v4-flash" (no "deepseek/" prefix).
-    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-    OPENROUTER_BASE_URL = os.getenv(
-        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-    )
-    # Note: "deepseek/deepseek-v4-flash-latest" is NOT a valid id on OpenRouter
-    # and returns 400.
-    DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek/deepseek-v4-flash")
     # LangSmith. Listed here for visibility only — the SDK reads these straight
     # out of os.environ, so it is the load_dotenv() call above that enables it.
     LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
@@ -72,8 +54,7 @@ class Settings:
     # happens the stream emits a `truncated` event and the UI says so rather
     # than leaving it a mystery — see _stream_graph in app/ai/chat.py.
     #
-    # LIGHT applies to the models that emit only visible text: DeepSeek (with
-    # reasoning explicitly disabled — see app/ai/models.py), Mistral and Gemini.
+    # LIGHT applies to the models that emit only visible text: Mistral and Gemini.
     # Every token of it reaches the reader.
     #
     # REASONING applies to openai/gpt-oss-20b alone, which spends hidden
@@ -206,10 +187,6 @@ class Settings:
     voice_max_tokens = VOICE_MAX_TOKENS
     light_max_tokens = LIGHT_MAX_TOKENS
     reasoning_max_tokens = REASONING_MAX_TOKENS
-    deepseek_api_key = DEEPSEEK_API_KEY
-    openrouter_api_key = OPENROUTER_API_KEY
-    openrouter_base_url = OPENROUTER_BASE_URL
-    deepseek_model = DEEPSEEK_MODEL
     tts_cache_enabled = TTS_CACHE_ENABLED
     clerk_secret_key = CLERK_SECRET_KEY
     clerk_webhook_secret = CLERK_WEBHOOK_SECRET

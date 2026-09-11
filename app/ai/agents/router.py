@@ -52,9 +52,7 @@ class QueryRouter:
 
     # Classification output is tiny — a route name and one rewritten sentence —
     # so the same small budget suits every model here, including the reasoning
-    # one. Note this is exactly why app/ai/models.py disables DeepSeek's
-    # reasoning: at 300 tokens, hidden reasoning could swallow the entire
-    # allowance and return no structured output at all.
+    # model (Groq).
     MAX_TOKENS = 300
 
     def __init__(self):
